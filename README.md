@@ -1,5 +1,8 @@
 # supermaven-language-server
 
+> [!WARNING]
+> This project is vibe-coded — proceed with caution.
+
 Pure Lua, in-process Supermaven language server for Neovim 0.12.
 
 This project wraps the existing `sm-agent` binary behind Neovim's built-in LSP client and exposes `textDocument/inlineCompletion` instead of managing its own preview UI, keymaps, or completion source.
