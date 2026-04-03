@@ -1,7 +1,5 @@
 local M = {}
 
-M.uv = vim.uv
-
 function M.trim(s) return (s:gsub('^%s*(.-)%s*$', '%1')) end
 
 function M.trim_start(s) return (s:gsub('^%s*', '')) end
