@@ -4,6 +4,8 @@ local uv = vim.uv
 
 local M = {
   cached_path = nil,
+  pending = false,
+  waiters = {},
 }
 
 local function platform_name()
@@ -30,43 +32,17 @@ local function binary_path(platform, arch)
   return vim.fs.joinpath(binary_dir(platform, arch), name)
 end
 
-local function request_sync(url, opts, timeout_ms)
-  local done, err, response = false, nil, nil
-  local request = vim.net.request(url, opts or {}, function(request_err, res)
-    err = request_err
-    response = res
-    done = true
-  end)
-
-  local ok = vim.wait(timeout_ms, function() return done end, 50, false)
-
-  if not ok then
-    request:close()
-    return nil, ('Timed out fetching %s'):format(url)
-  end
-
-  if err then return nil, err end
-
-  return response, nil
-end
-
-local function rename_file(from, to)
-  if uv.fs_stat(to) then uv.fs_unlink(to) end
-
-  local ok, err = uv.fs_rename(from, to)
-  if ok then return true end
-  return nil, err or ('Could not rename %s to %s'):format(from, to)
-end
-
-function M.fetch(settings)
+local function resolve_path(settings)
   local binary_settings = settings.binary or {}
-  if binary_settings.path and binary_settings.path ~= '' then return binary_settings.path end
+  if binary_settings.path and binary_settings.path ~= '' then
+    if uv.fs_stat(binary_settings.path) then
+      M.cached_path = binary_settings.path
+      return binary_settings.path
+    end
+    return nil, ('Configured Supermaven binary does not exist: %s'):format(binary_settings.path)
+  end
 
   if M.cached_path and uv.fs_stat(M.cached_path) then return M.cached_path end
-
-  if binary_settings.download == false then
-    return nil, 'Supermaven binary download is disabled and no binary path was configured.'
-  end
 
   local platform = platform_name()
   local arch = arch_name()
@@ -78,41 +54,128 @@ function M.fetch(settings)
     return path
   end
 
-  vim.fn.mkdir(binary_dir(platform, arch), 'p')
+  if binary_settings.download == false then
+    return nil, 'Supermaven binary download is disabled and no binary path was configured.'
+  end
 
+  return nil
+end
+
+local function rename_file(from, to)
+  if uv.fs_stat(to) then uv.fs_unlink(to) end
+
+  local ok, err = uv.fs_rename(from, to)
+  if ok then return true end
+  return nil, err or ('Could not rename %s to %s'):format(from, to)
+end
+
+local function dispatch_waiters(path, err)
+  local waiters = M.waiters
+  M.waiters = {}
+  M.pending = false
+
+  for _, callback in ipairs(waiters) do
+    vim.schedule(function() callback(path, err) end)
+  end
+end
+
+local function request_async(url, opts, timeout_ms, callback)
+  local done = false
+  local timer
+
+  local function finish(err, response)
+    if done then return end
+
+    done = true
+    if timer and not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+    callback(err, response)
+  end
+
+  local request = vim.net.request(url, opts or {}, function(request_err, res) finish(request_err, res) end)
+
+  if timeout_ms and timeout_ms > 0 then
+    timer = uv.new_timer()
+    timer:start(
+      timeout_ms,
+      0,
+      vim.schedule_wrap(function()
+        request:close()
+        finish(('Timed out fetching %s'):format(url), nil)
+      end)
+    )
+  end
+end
+
+function M.ready(settings) return resolve_path(settings) end
+
+function M.prefetch(settings, callback)
+  local path, err = resolve_path(settings)
+  if path or err then
+    if callback then vim.schedule(function() callback(path, err) end) end
+    return
+  end
+
+  if callback then M.waiters[#M.waiters + 1] = callback end
+
+  if M.pending then return end
+
+  M.pending = true
+
+  local platform = assert(platform_name())
+  local arch = assert(arch_name())
+  local path_to_download = binary_path(platform, arch)
+  local binary_settings = settings.binary or {}
   local timeout_ms = binary_settings.download_timeout_ms or 30000
   local discovery_url = ('https://supermaven.com/api/download-path-v2?platform=%s&arch=%s&editor=neovim'):format(
     platform,
     arch
   )
-  local discovery_res, discovery_err = request_sync(discovery_url, { retry = 3 }, timeout_ms)
-  if not discovery_res then return nil, ('Could not resolve Supermaven download URL: %s'):format(discovery_err) end
 
-  local ok, decoded = pcall(vim.json.decode, discovery_res.body)
-  local download_url = ok and decoded and decoded.downloadUrl or nil
-  if not download_url then return nil, 'Supermaven download discovery returned an invalid payload.' end
+  vim.fn.mkdir(binary_dir(platform, arch), 'p')
+  log.info(('Downloading Supermaven binary to %s'):format(path_to_download))
 
-  local temp_path = path .. '.tmp'
-  log.info(('Downloading Supermaven binary to %s'):format(path))
+  request_async(discovery_url, { retry = 3 }, timeout_ms, function(discovery_err, discovery_res)
+    if discovery_err then
+      dispatch_waiters(nil, ('Could not resolve Supermaven download URL: %s'):format(discovery_err))
+      return
+    end
 
-  local _, download_err = request_sync(download_url, { retry = 3, outpath = temp_path }, timeout_ms)
-  if download_err then
-    uv.fs_unlink(temp_path)
-    return nil, ('Could not download Supermaven binary: %s'):format(download_err)
-  end
+    local ok, decoded = pcall(vim.json.decode, discovery_res.body)
+    local download_url = ok and decoded and decoded.downloadUrl or nil
+    if not download_url then
+      dispatch_waiters(nil, 'Supermaven download discovery returned an invalid payload.')
+      return
+    end
 
-  if not uv.fs_stat(temp_path) then return nil, 'Supermaven binary download did not produce an output file.' end
+    local temp_path = path_to_download .. '.tmp'
+    request_async(download_url, { retry = 3, outpath = temp_path }, timeout_ms, function(download_err)
+      if download_err then
+        uv.fs_unlink(temp_path)
+        dispatch_waiters(nil, ('Could not download Supermaven binary: %s'):format(download_err))
+        return
+      end
 
-  local renamed, rename_err = rename_file(temp_path, path)
-  if not renamed then
-    uv.fs_unlink(temp_path)
-    return nil, ('Could not finalize Supermaven binary download: %s'):format(rename_err)
-  end
+      if not uv.fs_stat(temp_path) then
+        dispatch_waiters(nil, 'Supermaven binary download did not produce an output file.')
+        return
+      end
 
-  if platform ~= 'windows' then uv.fs_chmod(path, 493) end
+      local renamed, rename_err = rename_file(temp_path, path_to_download)
+      if not renamed then
+        uv.fs_unlink(temp_path)
+        dispatch_waiters(nil, ('Could not finalize Supermaven binary download: %s'):format(rename_err))
+        return
+      end
 
-  M.cached_path = path
-  return path
+      if platform ~= 'windows' then uv.fs_chmod(path_to_download, 493) end
+
+      M.cached_path = path_to_download
+      dispatch_waiters(path_to_download, nil)
+    end)
+  end)
 end
 
 return M

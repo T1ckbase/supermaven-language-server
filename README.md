@@ -59,5 +59,6 @@ Supported `settings.supermaven` fields:
 ## Notes
 
 - Binary downloads use `vim.net.request()`.
+- Binary downloads are prefetched in the background during LSP startup.
 - The server advertises `inlineCompletionProvider` and full text sync.
 - `positionEncoding` is set to `utf-8` so request positions line up with Lua byte offsets.

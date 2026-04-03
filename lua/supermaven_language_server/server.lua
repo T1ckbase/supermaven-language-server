@@ -103,6 +103,7 @@ function Transport:apply_settings(settings)
   self.settings = vim.tbl_deep_extend('force', self.settings, settings)
   log.configure(self.settings)
   self.agent:update_settings(self.settings)
+  self.agent:prepare()
 end
 
 function Transport:on_initialize(params, callback)

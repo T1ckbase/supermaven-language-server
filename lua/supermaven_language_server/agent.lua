@@ -28,6 +28,7 @@ function Agent.new(settings)
     stderr = nil,
     activate_url = nil,
     activation_notified = false,
+    start_error = nil,
   }, Agent)
 end
 
@@ -87,13 +88,21 @@ function Agent:send_message(updates)
   })
 end
 
-function Agent:ensure_started()
-  if self:is_running() then return true end
+function Agent:report_start_error(err)
+  if err and err ~= self.start_error then log.error(err) end
+  self.start_error = err
+end
 
-  local binary_path, err = downloader.fetch(self.settings)
-  if not binary_path then
-    log.error(err)
-    return nil, err
+function Agent:prepare()
+  downloader.prefetch(self.settings, function(_, err)
+    if err then self:report_start_error(err) end
+  end)
+end
+
+function Agent:start_binary(binary_path)
+  if self:is_running() then
+    self.start_error = nil
+    return true
   end
 
   self.stdin = uv.new_pipe(false)
@@ -133,11 +142,31 @@ function Agent:ensure_started()
   end
 
   self.handle = handle
+  self.start_error = nil
   self:read_stdout()
   self:read_stderr()
   self:send_json({ kind = 'greeting', allowGitignore = false })
 
   return true
+end
+
+function Agent:ensure_started()
+  if self:is_running() then
+    self.start_error = nil
+    return true
+  end
+
+  local binary_path, err = downloader.ready(self.settings)
+  if not binary_path then
+    downloader.prefetch(self.settings, function(_, prefetch_err)
+      if prefetch_err then self:report_start_error(prefetch_err) end
+    end)
+
+    if err then self:report_start_error(err) end
+    return nil, err or 'Supermaven binary is still downloading.'
+  end
+
+  return self:start_binary(binary_path)
 end
 
 function Agent:read_stdout()
